@@ -17,20 +17,37 @@
 #    * Per-run CPU utilisation sampling (mpstat) and package power via RAPL
 #      -> NOPM/Watt "performance-per-watt" numbers for the PoC story
 #    * Scaling-efficiency analysis (speedup vs baseline, % efficiency)
+#    * Scale-out mode: every eligible core count is benchmarked BOTH as a
+#      single MariaDB instance AND as N independent containers of
+#      --shard-cores each (e.g. 32c -> 1x32c single instance AND 4x8c
+#      scale-out), aggregating throughput across the shards. This shows
+#      the throughput ceiling of a single instance alongside what
+#      horizontal scale-out recovers from it. Enabled by default; disable
+#      with --no-scale-out to reproduce single-instance-only behavior.
 #    * Consolidated Markdown report + optional PDF (via pandoc)
 #
 #  Usage:
-#     bash amd-mariadb-poc.sh              # interactive wizard
-#     bash amd-mariadb-poc.sh --yes        # accept all defaults
+#     bash amd-mariadb-poc-v1.3.sh              # interactive wizard
+#     bash amd-mariadb-poc-v1.3.sh --yes        # accept all defaults
 #
 #  Options (all optional — the wizard asks for anything not given):
-#     --cores "8 16 32 64"    Core counts to test
-#     --warehouses N          TPC-C warehouses (recommend >= 10x max cores)
+#     --cores "8 16 32"       Core counts to test (default: multiples of
+#                              --shard-cores up to the host's core count)
+#     --shard-cores N         Cores per scale-out container (default 8) —
+#                              also sets the step of the default core list
+#     --no-scale-out           Single-instance only (skip scale-out rows)
+#     --warehouses N          TPC-C warehouses for the single-instance runs
+#                              (recommend >= 10x max cores). Scale-out
+#                              containers auto-size to 10x their own
+#                              --shard-cores unless --warehouses is given
+#                              explicitly, in which case it applies to
+#                              every shard unchanged.
 #     --rampup N              Ramp-up minutes            (default 2)
 #     --duration N            Timed-run minutes          (default 10)
 #     --tpch                  Also run TPC-H analytics
 #     --tpch-sf N             TPC-H scale factor         (default 1)
 #     --buffer-pool SIZE      InnoDB buffer pool, e.g. 64G (default 75% RAM)
+#                              Scale-out containers split this evenly.
 #     --mariadb-ver VER       MariaDB image tag          (default 11.4)
 #     --numa-node N           Pin runs to NUMA node N (auto cpuset per count)
 #     --no-host-tuning        Skip governor/hugepage/swappiness tuning
@@ -39,7 +56,9 @@
 #     --title "Text"          Report title override
 #     --workdir PATH          Output dir (default ./amd-poc-YYYYMMDD-HHMM)
 #     --base-dir PATH         Path to a mariadb-tpcc-bench checkout
-#                             (default: auto-clone next to workdir)
+#                             (default: auto-clone next to workdir; scale-out
+#                             mode needs a checkout with --container-name /
+#                             --tmp-dir support)
 #     --dry-run               Show the plan, run nothing
 #     --yes                   Non-interactive, accept defaults/flags
 #     -h | --help             This help
@@ -59,12 +78,13 @@ log()  { echo -e "${CYN}[$(date '+%H:%M:%S')]${RST} $*"; }
 ok()   { echo -e "${GRN}[$(date '+%H:%M:%S')] \xe2\x9c\x94 $*${RST}"; }
 warn() { echo -e "${YEL}[$(date '+%H:%M:%S')] \xe2\x9a\xa0 $*${RST}"; }
 die()  { echo -e "${RED}[$(date '+%H:%M:%S')] \xe2\x9c\x96 $*${RST}" >&2; exit 1; }
-hr()   { echo -e "${BLD}\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81${RST}"; }
+hr()   { echo -e "${BLD}\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81\xe2\x94\x81${RST}"; }
 section() { hr; echo -e "${BLD}  $*${RST}"; hr; }
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 CORES_LIST=""
 WAREHOUSES=""
+WAREHOUSES_EXPLICIT=false
 RAMPUP=2
 DURATION=10
 RUN_TPCH=false
@@ -80,12 +100,15 @@ WORKDIR=""
 BASE_DIR=""
 DRY_RUN=false
 YES=false
+SHARD_CORES=8
+SCALE_OUT=true
+SHARD_PORT_BASE=3400
 
 # ── Args ─────────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case $1 in
     --cores)          CORES_LIST="$2"; shift 2 ;;
-    --warehouses)     WAREHOUSES="$2"; shift 2 ;;
+    --warehouses)     WAREHOUSES="$2"; WAREHOUSES_EXPLICIT=true; shift 2 ;;
     --rampup)         RAMPUP="$2"; shift 2 ;;
     --duration)       DURATION="$2"; shift 2 ;;
     --tpch)           RUN_TPCH=true; shift ;;
@@ -94,6 +117,8 @@ while [[ $# -gt 0 ]]; do
     --mariadb-ver)    MARIADB_VER="$2"; shift 2 ;;
     --numa-node)      NUMA_NODE="$2"; shift 2 ;;
     --no-host-tuning) HOST_TUNING=false; shift ;;
+    --shard-cores)    SHARD_CORES="$2"; shift 2 ;;
+    --no-scale-out)   SCALE_OUT=false; shift ;;
     --report)         REPORT_FMT="$2"; shift 2 ;;
     --customer)       CUSTOMER="$2"; shift 2 ;;
     --title)          TITLE="$2"; shift 2 ;;
@@ -109,6 +134,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$REPORT_FMT" in md|pdf|both) : ;; *) die "--report must be md, pdf or both" ;; esac
+[[ "$SHARD_CORES" =~ ^[0-9]+$ && "$SHARD_CORES" -ge 1 ]] || die "--shard-cores must be a positive integer"
 
 # ── Prompt helper ────────────────────────────────────────────────────────────
 # prompt VAR "Question" "default"
@@ -235,6 +261,14 @@ fetch_base_repo() {
   ok "Base runner ready."
 }
 
+check_scaleout_support() {
+  $SCALE_OUT || return 0
+  $DRY_RUN && [[ ! -f "$BASE_DIR/mariadb-tpcc-bench.sh" ]] && return 0
+  if ! grep -q -- '--container-name' "$BASE_DIR/mariadb-tpcc-bench.sh" 2>/dev/null; then
+    die "Scale-out mode needs a base runner with --container-name/--tmp-dir support (not found in $BASE_DIR/mariadb-tpcc-bench.sh). Point --base-dir at a patched checkout, or pass --no-scale-out."
+  fi
+}
+
 # ── System inventory capture ─────────────────────────────────────────────────
 collect_sysinfo() {
   local dir="$WORKDIR/sysinfo"
@@ -280,6 +314,15 @@ bp_to_mib() {  # "64G" / "8192M" -> MiB
   esac
 }
 
+mib_to_size() {  # MiB -> compact size string, e.g. 8192 -> "8G", 6000 -> "6000M"
+  local mib=$1
+  if (( mib >= 1024 && mib % 1024 == 0 )); then
+    echo "$(( mib / 1024 ))G"
+  else
+    echo "${mib}M"
+  fi
+}
+
 apply_host_tuning() {
   section "Applying host tuning (reverted automatically on exit)"
   $DRY_RUN && { log "[dry-run] would set governor=performance, swappiness=1, THP=never, hugepages"; return; }
@@ -319,6 +362,9 @@ apply_host_tuning() {
   # 4. Explicit hugepages sized to buffer pool + 6% headroom (2 MiB pages).
   #    The base runner enables MariaDB large_pages automatically when
   #    vm.nr_hugepages > 0 and mounts /dev/hugepages into the container.
+  #    Sized off the TOTAL buffer pool, which correctly covers scale-out
+  #    mode too since shard buffer pools are a split of this same total and
+  #    all shards for a core count run concurrently.
   ORIG_HUGEPAGES=$(cat /proc/sys/vm/nr_hugepages)
   local bp_mib; bp_mib=$(bp_to_mib "$BUFFER_POOL")
   HP_FOR_BP=$(( bp_mib * 106 / 100 / 2 ))
@@ -362,7 +408,10 @@ revert_host_tuning() {
 # When the run is pinned to one NUMA node (--numa-node), RAPL_NODE_PKGS
 # (resolved once by resolve_rapl_scope, below) restricts summing to that
 # node's physical package(s) -- otherwise a NUMA-pinned run still reports
-# combined power for every socket on the host, including idle ones.
+# combined power for every socket on the host, including idle ones. In
+# scale-out mode, all shards for a NUMA-pinned core count are already
+# confined to that same node's cpulist (see shard_cpusets), so this scoping
+# correctly covers the whole concurrent shard batch too.
 RAPL_NODE_PKGS=""   # space-separated physical_package_id list; empty = all packages
 
 # Resolves RAPL_NODE_PKGS from NUMA_NODE's cpulist -> each CPU's
@@ -450,6 +499,117 @@ rapl_sample_loop() {
   done
 }
 
+# ── CPU list helpers (scale-out shard pinning) ───────────────────────────────
+# Expand "0-3,8-11" into CPULIST_EXPANDED=(0 1 2 3 8 9 10 11)
+CPULIST_EXPANDED=()
+expand_cpulist() {
+  local list=$1 part start end i
+  CPULIST_EXPANDED=()
+  IFS=',' read -ra _parts <<< "$list"
+  for part in "${_parts[@]}"; do
+    part="${part// /}"
+    [[ -z "$part" ]] && continue
+    if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
+      for (( i=start; i<=end; i++ )); do CPULIST_EXPANDED+=("$i"); done
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      CPULIST_EXPANDED+=("$part")
+    fi
+  done
+}
+
+# Compacts CPU ids (args) into a range string, e.g. "0-3,8-11"
+compact_cpulist() {
+  local result="" range_start prev=-1 cpu
+  for cpu in "$@"; do
+    if [[ $prev -eq -1 ]]; then range_start=$cpu; prev=$cpu
+    elif [[ $cpu -eq $(( prev + 1 )) ]]; then prev=$cpu
+    else
+      [[ -n "$result" ]] && result+=","
+      [[ $range_start -eq $prev ]] && result+="$range_start" || result+="${range_start}-${prev}"
+      range_start=$cpu; prev=$cpu
+    fi
+  done
+  if [[ $prev -ne -1 ]]; then
+    [[ -n "$result" ]] && result+=","
+    [[ $range_start -eq $prev ]] && result+="$range_start" || result+="${range_start}-${prev}"
+  fi
+  echo "$result"
+}
+
+# NUMA-grouped pool of usable CPU ids -> CPU_POOL. Consecutive shards stay
+# within one node when node sizes line up with --shard-cores.
+CPU_POOL=()
+build_cpu_pool() {
+  CPU_POOL=()
+  if [[ -n "$NUMA_NODE" ]]; then
+    local cl; cl=$(cat "/sys/devices/system/node/node${NUMA_NODE}/cpulist" 2>/dev/null || echo "")
+    if [[ -n "$cl" ]]; then expand_cpulist "$cl"; CPU_POOL=( "${CPULIST_EXPANDED[@]}" ); fi
+  elif (( NUMA_NODES > 1 )); then
+    local n cl
+    for (( n=0; n<NUMA_NODES; n++ )); do
+      cl=$(cat "/sys/devices/system/node/node${n}/cpulist" 2>/dev/null || echo "")
+      if [[ -n "$cl" ]]; then
+        expand_cpulist "$cl"
+        CPU_POOL+=( "${CPULIST_EXPANDED[@]}" )
+      fi
+    done
+  fi
+  if (( ${#CPU_POOL[@]} == 0 )); then
+    local c; for (( c=0; c<HOST_CORES; c++ )); do CPU_POOL+=("$c"); done
+  fi
+}
+
+# shard_cpusets TOTAL_CORES SHARD_CORES -> fills SHARD_CPUSETS with
+# (TOTAL_CORES/SHARD_CORES) disjoint cpuset range strings.
+SHARD_CPUSETS=()
+shard_cpusets() {
+  local total_cores=$1 shard_cores=$2
+  build_cpu_pool
+  (( ${#CPU_POOL[@]} < total_cores )) \
+    && die "Not enough CPUs available (${#CPU_POOL[@]}) to pin ${total_cores} scale-out cores."
+  local num_shards=$(( total_cores / shard_cores )) i
+  SHARD_CPUSETS=()
+  for (( i=0; i<num_shards; i++ )); do
+    local -a chunk=( "${CPU_POOL[@]:$(( i * shard_cores )):shard_cores}" )
+    SHARD_CPUSETS+=( "$(compact_cpulist "${chunk[@]}")" )
+  done
+}
+
+# ── mpstat/RAPL sampling helpers (wrap a measured phase) ─────────────────────
+# start_sampling MDIR RAPL_MAX -> echoes "mpid rpid" (either may be blank)
+start_sampling() {
+  local mdir=$1 rapl_max=$2
+  mkdir -p "$mdir"
+  local mpid="" rpid=""
+  if $HAVE_MPSTAT && ! $DRY_RUN; then
+    mpstat 10 > "$mdir/mpstat.log" 2>/dev/null & mpid=$!
+  fi
+  rm -f "$mdir/rapl_accum.txt"
+  if [[ -n "${rapl_max:-}" ]] && ! $DRY_RUN; then
+    rapl_sample_loop "$mdir" "$rapl_max" 2 & rpid=$!
+  fi
+  echo "${mpid:-_} ${rpid:-_}"
+}
+
+# stop_sampling MDIR MPID RPID T0 T1 -> writes power.txt if RAPL data present
+stop_sampling() {
+  local mdir=$1 mpid=$2 rpid=$3 t0=$4 t1=$5
+  [[ "$mpid" != "_" ]] && { kill "$mpid" 2>/dev/null || true; wait "$mpid" 2>/dev/null || true; }
+  [[ "$rpid" != "_" ]] && { kill "$rpid" 2>/dev/null || true; wait "$rpid" 2>/dev/null || true; }
+  if [[ -f "$mdir/rapl_accum.txt" ]]; then
+    local total_uj total_s
+    total_uj=$(grep -oP '(?<=total_uj=)\d+' "$mdir/rapl_accum.txt")
+    total_s=$(grep -oP '(?<=total_s=)\d+' "$mdir/rapl_accum.txt")
+    if [[ -n "$total_uj" && -n "$total_s" ]] && (( total_s > 0 )); then
+      awk -v de="$total_uj" -v s="$total_s" 'BEGIN{printf "avg_pkg_watts=%.1f\n", de/1e6/s}' > "$mdir/power.txt"
+      echo "elapsed_s=$(( t1 - t0 ))" >> "$mdir/power.txt"
+      ok "Avg package power: $(grep -oP '(?<=avg_pkg_watts=).*' "$mdir/power.txt") W"
+    fi
+    rm -f "$mdir/rapl_accum.txt"
+  fi
+}
+
 # ── Interactive wizard ───────────────────────────────────────────────────────
 wizard() {
   section "AMD MariaDB PoC — Configuration"
@@ -461,9 +621,16 @@ wizard() {
   fi
   echo ""
 
-  # Core counts
-  local def_cores=""
-  for n in 8 16 32 64 96 128; do (( n <= HOST_CORES )) && def_cores+="$n "; done
+  # Scale-out shard size — also drives the default core-count list below
+  if ! $YES; then
+    prompt SHARD_CORES "Cores per scale-out container (also sets the default core-list step)" "$SHARD_CORES"
+    [[ "$SHARD_CORES" =~ ^[0-9]+$ && "$SHARD_CORES" -ge 1 ]] || die "Invalid shard size: '$SHARD_CORES'"
+  fi
+
+  # Core counts — default list is every multiple of SHARD_CORES up to the
+  # host's actual core count (not capped), so bigger SUTs sweep further.
+  local def_cores="" n
+  for (( n=SHARD_CORES; n<=HOST_CORES; n+=SHARD_CORES )); do def_cores+="$n "; done
   def_cores="${def_cores% }"
   [[ -z "$def_cores" ]] && def_cores="$HOST_CORES"
   if [[ -z "$CORES_LIST" ]]; then
@@ -490,6 +657,17 @@ wizard() {
     [[ "$NUMA_NODE" == "none" ]] && NUMA_NODE=""
   fi
 
+  # Scale-out toggle
+  if $SCALE_OUT && ! $YES; then
+    echo ""
+    log "Scale-out mode benchmarks every eligible core count TWICE: once as a"
+    log "single MariaDB instance, and once as N x ${SHARD_CORES}-core independent"
+    log "containers running concurrently, aggregating their throughput. This"
+    log "roughly doubles run time for those core counts but shows how much"
+    log "horizontal scale-out recovers from single-instance lock contention."
+    confirm "Also run scale-out benchmarks?" default_yes || SCALE_OUT=false
+  fi
+
   # Warehouses — >=10x max VUs avoids hot-row contention masking CPU scaling
   if [[ -z "$WAREHOUSES" ]]; then
     local rec=$(( maxc * 10 )); (( rec < 64 )) && rec=64
@@ -497,7 +675,11 @@ wizard() {
     log "TPC-C warehouses: for linear core scaling use >= 10x the highest VU"
     log "count, i.e. >= $(( maxc * 10 )) for a ${maxc}-core run. Smaller counts plateau"
     log "early from hot-row contention (schema build takes ~15s/warehouse)."
-    prompt WAREHOUSES "TPC-C warehouse count" "$rec"
+    prompt WAREHOUSES "TPC-C warehouse count (single-instance runs)" "$rec"
+  fi
+  if $SCALE_OUT; then
+    log "Scale-out containers auto-size warehouses to 10x their own ${SHARD_CORES} cores" \
+        "(use --warehouses on the command line to override every shard uniformly)."
   fi
 
   prompt RAMPUP   "Ramp-up minutes per run"  "$RAMPUP"
@@ -511,7 +693,7 @@ wizard() {
   # Buffer pool
   if [[ -z "$BUFFER_POOL" ]]; then
     local bp=$(( HOST_RAM_GiB * 3 / 4 )); (( bp < 1 )) && bp=1
-    prompt BUFFER_POOL "InnoDB buffer pool size" "${bp}G"
+    prompt BUFFER_POOL "InnoDB buffer pool size (total; scale-out splits this across shards)" "${bp}G"
   fi
   # MariaDB reads a bare number as bytes, so a missing unit (e.g. "16"
   # instead of "16G") silently creates an InnoDB buffer pool far too small
@@ -538,6 +720,7 @@ wizard() {
   echo ""
   section "Run Plan"
   printf "  %-22s %s\n" "Core counts:"      "$CORES_LIST"
+  printf "  %-22s %s\n" "Scale-out:"        "$($SCALE_OUT && echo "yes — ${SHARD_CORES}c containers" || echo no)"
   printf "  %-22s %s\n" "NUMA node pin:"    "${NUMA_NODE:-none}"
   printf "  %-22s %s\n" "Warehouses:"       "$WAREHOUSES"
   printf "  %-22s %s\n" "Ramp / timed:"     "${RAMPUP}m / ${DURATION}m per run"
@@ -547,75 +730,149 @@ wizard() {
   printf "  %-22s %s\n" "Host tuning:"      "$($HOST_TUNING && echo yes || echo no)"
   printf "  %-22s %s\n" "Report:"           "$REPORT_FMT"
   printf "  %-22s %s\n" "Output dir:"       "$WORKDIR"
-  local nruns; nruns=$(wc -w <<< "$CORES_LIST")
+  local nruns=0
+  for c in $CORES_LIST; do
+    nruns=$(( nruns + 1 ))
+    $SCALE_OUT && (( c % SHARD_CORES == 0 && c > SHARD_CORES )) && nruns=$(( nruns + 1 ))
+  done
   local build_min=$(( WAREHOUSES * 15 / 60 + 1 ))
   local est=$(( nruns * (build_min + RAMPUP + DURATION + 5) ))
-  log "Rough time estimate: ~${est} min (schema is rebuilt for every core count)."
+  log "Rough time estimate: ~${est} min (schema is rebuilt for every run; scale-out"
+  log "runs count separately but its shards build concurrently)."
   echo ""
   if ! $YES && ! $DRY_RUN; then
     confirm "Proceed?" default_yes || die "Aborted by user."
   fi
 }
 
-# ── Per-config run: drive the base runner + sample power/CPU ─────────────────
+# ── Single-instance run: drive the base runner + sample power/CPU ───────────
+run_single_instance() {
+  local c=$1 rapl_max=$2; shift 2
+  local -a common=( "$@" )
+  section "Benchmark: ${c} cores — single instance"
+  local mdir="$WORKDIR/metrics/${c}core/single"
+  local t0 t1 samp mpid rpid
+  t0=$(date +%s)
+  samp=$(start_sampling "$mdir" "$rapl_max"); read -r mpid rpid <<< "$samp"
+
+  local -a flags=( "${common[@]}" --workdir "$WORKDIR/bench" --warehouses "$WAREHOUSES"
+                    --buffer-pool "$BUFFER_POOL" --cores "$c" )
+  [[ -n "$NUMA_NODE" ]] && flags+=( --numa-node "$NUMA_NODE" )
+
+  ( cd "$BASE_DIR" && bash mariadb-tpcc-bench.sh "${flags[@]}" ) \
+    || warn "Base runner exited non-zero for ${c}c single instance — check logs in $WORKDIR/bench/results/${c}core/"
+
+  t1=$(date +%s)
+  stop_sampling "$mdir" "$mpid" "$rpid" "$t0" "$t1"
+}
+
+# ── Scale-out run: N concurrent containers of --shard-cores each ────────────
+run_scaleout() {
+  local c=$1 rapl_max=$2; shift 2
+  local -a common=( "$@" )
+  local num_shards=$(( c / SHARD_CORES ))
+  section "Benchmark: ${c} cores — scale-out (${num_shards} x ${SHARD_CORES}c containers)"
+
+  shard_cpusets "$c" "$SHARD_CORES"
+  local -a cpusets=( "${SHARD_CPUSETS[@]}" )
+
+  local shard_ware
+  if $WAREHOUSES_EXPLICIT; then
+    shard_ware="$WAREHOUSES"
+  else
+    shard_ware=$(( SHARD_CORES * 10 )); (( shard_ware < 64 )) && shard_ware=64
+  fi
+
+  local bp_mib_total shard_bp_mib shard_bp
+  bp_mib_total=$(bp_to_mib "$BUFFER_POOL")
+  shard_bp_mib=$(( bp_mib_total / num_shards )); (( shard_bp_mib < 256 )) && shard_bp_mib=256
+  shard_bp=$(mib_to_size "$shard_bp_mib")
+
+  log "Per shard: ${SHARD_CORES}c, ${shard_ware} warehouses, buffer pool ${shard_bp}"
+
+  local mdir="$WORKDIR/metrics/${c}core/scaleout"
+  local t0 t1 samp mpid rpid
+  t0=$(date +%s)
+  samp=$(start_sampling "$mdir" "$rapl_max"); read -r mpid rpid <<< "$samp"
+
+  local -a pids=()
+  local i
+  for (( i=0; i<num_shards; i++ )); do
+    local shard_workdir="$WORKDIR/bench-scaleout/${c}core/shard${i}"
+    local shard_tmp="$mdir/tmp-s${i}"
+    local shard_port=$(( SHARD_PORT_BASE + i ))
+    local -a shard_flags=( "${common[@]}"
+                            --workdir "$shard_workdir"
+                            --warehouses "$shard_ware"
+                            --buffer-pool "$shard_bp"
+                            --cores "$SHARD_CORES"
+                            --port "$shard_port"
+                            --container-name "mariadb-bench-${c}c-s${i}"
+                            --tmp-dir "$shard_tmp" )
+    [[ -n "${cpusets[$i]:-}" ]] && shard_flags+=( --cpuset "${cpusets[$i]}" )
+    mkdir -p "$mdir"
+    ( cd "$BASE_DIR" && bash mariadb-tpcc-bench.sh "${shard_flags[@]}" ) \
+      > "$mdir/shard${i}.log" 2>&1 &
+    pids+=( $! )
+  done
+
+  local fail=0 p
+  for p in "${pids[@]}"; do
+    wait "$p" || fail=$(( fail + 1 ))
+  done
+  (( fail > 0 )) && warn "${fail}/${num_shards} scale-out shards for ${c}c exited non-zero — check $mdir/shard*.log"
+
+  t1=$(date +%s)
+  stop_sampling "$mdir" "$mpid" "$rpid" "$t0" "$t1"
+
+  # ── aggregate ────────────────────────────────────────────────────────────
+  local total_nopm=0 total_tpm=0 total_vus=0 shards_ok=0
+  for (( i=0; i<num_shards; i++ )); do
+    local s="$WORKDIR/bench-scaleout/${c}core/shard${i}/results/${SHARD_CORES}core/tpcc_summary.txt"
+    [[ -f "$s" ]] || continue
+    local sn st sv
+    sn=$(grep -oP '(?<=NOPM=)\d+' "$s" 2>/dev/null || echo "")
+    st=$(grep -oP '(?<=TPM=)\d+'  "$s" 2>/dev/null || echo "")
+    sv=$(grep -oP '(?<=VUs=)\d+'  "$s" 2>/dev/null | head -1 || echo "")
+    [[ "$sn" =~ ^[0-9]+$ ]] && total_nopm=$(( total_nopm + sn ))
+    [[ "$st" =~ ^[0-9]+$ ]] && total_tpm=$(( total_tpm + st ))
+    [[ "$sv" =~ ^[0-9]+$ ]] && total_vus=$(( total_vus + sv ))
+    shards_ok=$(( shards_ok + 1 ))
+  done
+  {
+    echo "shards=$num_shards"
+    echo "shard_cores=$SHARD_CORES"
+    echo "total_nopm=$total_nopm"
+    echo "total_tpm=$total_tpm"
+    echo "total_vus=$total_vus"
+    echo "shards_ok=$shards_ok"
+  } > "$mdir/aggregate_summary.txt"
+  ok "Scale-out ${c}c: ${shards_ok}/${num_shards} shards ok — aggregate NOPM=$total_nopm TPM=$total_tpm"
+}
+
 run_all_configs() {
-  local base_flags=( --workdir "$WORKDIR/bench"
-                     --warehouses "$WAREHOUSES"
-                     --rampup "$RAMPUP" --duration "$DURATION"
-                     --buffer-pool "$BUFFER_POOL"
-                     --mariadb-ver "$MARIADB_VER"
-                     --yes )
-  $RUN_TPCH   && base_flags+=( --tpch-sf "$TPCH_SF" ) || base_flags+=( --skip-tpch )
-  [[ -n "$NUMA_NODE" ]] && base_flags+=( --numa-node "$NUMA_NODE" )
-  $DRY_RUN    && base_flags+=( --dry-run )
+  local -a base_flags_common=( --rampup "$RAMPUP" --duration "$DURATION"
+                                --mariadb-ver "$MARIADB_VER" --yes )
+  $RUN_TPCH && base_flags_common+=( --tpch-sf "$TPCH_SF" ) || base_flags_common+=( --skip-tpch )
+  $DRY_RUN  && base_flags_common+=( --dry-run )
 
   local rapl_max; rapl_max=$(rapl_max_uj || true)
   [[ -n "${rapl_max:-}" ]] && log "RAPL package energy counters available — capturing power per run." \
                            || warn "RAPL energy counters not readable — NOPM/Watt will be omitted (try running as root)."
 
+  # NOTE: single-instance always runs before scale-out for a given core
+  # count, and the smallest core count in the sweep is always single-only
+  # (== SHARD_CORES). This guarantees HammerDB is downloaded/cached by that
+  # first sequential run before any concurrent scale-out shards ever launch
+  # — avoiding a race on the shared $HOME/HammerDB install. Do not reorder.
   local c
   for c in $CORES_LIST; do
-    section "Benchmark: ${c} cores"
-    local mdir="$WORKDIR/metrics/${c}core"
-    mkdir -p "$mdir"
+    run_single_instance "$c" "$rapl_max" "${base_flags_common[@]}"
 
-    # background CPU utilisation sampling
-    local mpid=""
-    if $HAVE_MPSTAT && ! $DRY_RUN; then
-      mpstat 10 > "$mdir/mpstat.log" 2>/dev/null & mpid=$!
-    fi
-
-    # background RAPL power sampling (continuous, wrap-safe — see rapl_sample_loop)
-    local rpid=""
-    rm -f "$mdir/rapl_accum.txt"
-    if [[ -n "${rapl_max:-}" ]] && ! $DRY_RUN; then
-      rapl_sample_loop "$mdir" "$rapl_max" 2 & rpid=$!
-    fi
-
-    local t0 t1
-    t0=$(date +%s)
-
-    # one core count per invocation so metrics map 1:1 to runs
-    ( cd "$BASE_DIR" && bash mariadb-tpcc-bench.sh "${base_flags[@]}" --cores "$c" ) \
-      || warn "Base runner exited non-zero for ${c} cores — check logs in $WORKDIR/bench/results/${c}core/"
-
-    t1=$(date +%s)
-
-    [[ -n "$mpid" ]] && { kill "$mpid" 2>/dev/null || true; wait "$mpid" 2>/dev/null || true; }
-    [[ -n "$rpid" ]] && { kill "$rpid" 2>/dev/null || true; wait "$rpid" 2>/dev/null || true; }
-
-    # average package power over the whole config (build+run), computed from
-    # a continuous wrap-safe sampler rather than one before/after snapshot
-    if [[ -f "$mdir/rapl_accum.txt" ]]; then
-      local total_uj total_s
-      total_uj=$(grep -oP '(?<=total_uj=)\d+' "$mdir/rapl_accum.txt")
-      total_s=$(grep -oP '(?<=total_s=)\d+' "$mdir/rapl_accum.txt")
-      if [[ -n "$total_uj" && -n "$total_s" ]] && (( total_s > 0 )); then
-        awk -v de="$total_uj" -v s="$total_s" 'BEGIN{printf "avg_pkg_watts=%.1f\n", de/1e6/s}' > "$mdir/power.txt"
-        echo "elapsed_s=$(( t1 - t0 ))" >> "$mdir/power.txt"
-        ok "Avg package power over ${c}-core config: $(grep -oP '(?<=avg_pkg_watts=).*' "$mdir/power.txt") W"
-      fi
-      rm -f "$mdir/rapl_accum.txt"
+    if $SCALE_OUT && (( c % SHARD_CORES == 0 && c > SHARD_CORES )); then
+      run_scaleout "$c" "$rapl_max" "${base_flags_common[@]}"
+    elif $SCALE_OUT && (( c % SHARD_CORES != 0 )); then
+      warn "Skipping scale-out for ${c}c — not evenly divisible by --shard-cores ${SHARD_CORES}."
     fi
   done
 }
@@ -630,28 +887,63 @@ build_report() {
   local rpt="$WORKDIR/${REPORT_BASENAME}.md"
   section "Building consolidated PoC report"
 
-  # completed core counts, sorted
-  local -a done_cores=()
-  local d c
-  for d in "$rdir"/*core/; do
-    [[ -f "$d/tpcc_summary.txt" ]] || continue
-    done_cores+=( "$(basename "$d" | sed 's/core//')" )
-  done
-  (( ${#done_cores[@]} )) || { warn "No results found — no report generated."; return 1; }
-  IFS=$'\n' done_cores=( $(sort -n <<< "${done_cores[*]}") ); unset IFS
+  # sorted, de-duplicated core-count sweep (independent of how --cores was typed)
+  local -a cores_sorted
+  IFS=$'\n' cores_sorted=( $(tr ' ' '\n' <<< "$CORES_LIST" | sort -n -u) ); unset IFS
 
-  # gather metrics into parallel arrays
-  local -a nopms=() vus=() watts=()
-  local baseline_c="${done_cores[0]}" baseline_nopm=""
-  for c in "${done_cores[@]}"; do
+  # one row per (cores, mode) that actually produced results, in sweep order
+  local -a row_cores=() row_mode=() row_containers=() row_nopm=() row_vus=() row_watts=()
+  local c
+  for c in "${cores_sorted[@]}"; do
     local s="$rdir/${c}core/tpcc_summary.txt"
-    local n v w
-    n=$(grep -oP '(?<=NOPM=)\d+' "$s" 2>/dev/null || echo "")
-    v=$(grep -oP '(?<=VUs=)\d+'  "$s" 2>/dev/null | head -1 || echo "")
-    w=$(grep -oP '(?<=avg_pkg_watts=).*' "$WORKDIR/metrics/${c}core/power.txt" 2>/dev/null || echo "")
-    nopms+=( "${n:--}" ); vus+=( "${v:--}" ); watts+=( "${w:--}" )
-    [[ -z "$baseline_nopm" && -n "$n" ]] && { baseline_nopm="$n"; baseline_c="$c"; }
+    if [[ -f "$s" ]]; then
+      local n v w
+      n=$(grep -oP '(?<=NOPM=)\d+' "$s" 2>/dev/null || echo "")
+      v=$(grep -oP '(?<=VUs=)\d+'  "$s" 2>/dev/null | head -1 || echo "")
+      w=$(grep -oP '(?<=avg_pkg_watts=).*' "$WORKDIR/metrics/${c}core/single/power.txt" 2>/dev/null || echo "")
+      row_cores+=("$c"); row_mode+=("single"); row_containers+=("1")
+      row_nopm+=("${n:--}"); row_vus+=("${v:--}"); row_watts+=("${w:--}")
+    fi
+    local agg="$WORKDIR/metrics/${c}core/scaleout/aggregate_summary.txt"
+    if [[ -f "$agg" ]]; then
+      local n v shards w
+      n=$(grep -oP '(?<=total_nopm=)\d+' "$agg" 2>/dev/null || echo "")
+      v=$(grep -oP '(?<=total_vus=)\d+'  "$agg" 2>/dev/null || echo "")
+      shards=$(grep -oP '(?<=shards=)\d+' "$agg" 2>/dev/null || echo "?")
+      w=$(grep -oP '(?<=avg_pkg_watts=).*' "$WORKDIR/metrics/${c}core/scaleout/power.txt" 2>/dev/null || echo "")
+      row_cores+=("$c"); row_mode+=("scaleout"); row_containers+=("$shards")
+      row_nopm+=("${n:--}"); row_vus+=("${v:--}"); row_watts+=("${w:--}")
+    fi
   done
+  (( ${#row_cores[@]} )) || { warn "No results found — no report generated."; return 1; }
+
+  # baseline = smallest single-instance row with a numeric NOPM
+  local baseline_nopm="" baseline_c="" i
+  for i in "${!row_cores[@]}"; do
+    if [[ "${row_mode[$i]}" == single && "${row_nopm[$i]}" =~ ^[0-9]+$ ]]; then
+      baseline_nopm="${row_nopm[$i]}"; baseline_c="${row_cores[$i]}"; break
+    fi
+  done
+
+  # largest single-instance row (for the single-instance headline speedup)
+  local top_single_i=-1
+  for i in "${!row_cores[@]}"; do
+    [[ "${row_mode[$i]}" == single && "${row_nopm[$i]}" =~ ^[0-9]+$ ]] && top_single_i=$i
+  done
+
+  # largest scale-out row + the single-instance NOPM at that same core count
+  local hero_i=-1
+  for i in "${!row_cores[@]}"; do
+    [[ "${row_mode[$i]}" == scaleout && "${row_nopm[$i]}" =~ ^[0-9]+$ ]] && hero_i=$i
+  done
+  local hero_single_nopm=""
+  if (( hero_i >= 0 )); then
+    for i in "${!row_cores[@]}"; do
+      if [[ "${row_cores[$i]}" == "${row_cores[$hero_i]}" && "${row_mode[$i]}" == single ]]; then
+        hero_single_nopm="${row_nopm[$i]}"
+      fi
+    done
+  fi
 
   {
     echo "---"
@@ -663,20 +955,30 @@ build_report() {
     echo ""
     echo "# Executive Summary"
     echo ""
-    local last_i=$(( ${#done_cores[@]} - 1 ))
-    if [[ -n "$baseline_nopm" && "${nopms[$last_i]}" =~ ^[0-9]+$ ]]; then
+    if [[ -n "$baseline_nopm" && $top_single_i -ge 0 ]]; then
       local top_speedup
-      top_speedup=$(awk -v a="${nopms[$last_i]}" -v b="$baseline_nopm" 'BEGIN{printf "%.2f", a/b}')
+      top_speedup=$(awk -v a="${row_nopm[$top_single_i]}" -v b="$baseline_nopm" 'BEGIN{printf "%.2f", a/b}')
       echo "MariaDB ${MARIADB_VER} was benchmarked with the industry-standard HammerDB"
-      echo "TPC-C OLTP workload at ${#done_cores[@]} CPU-core configurations"
-      echo "(${done_cores[*]} cores) on the system described below. Throughput scaled"
-      echo "from **$(printf "%'d" "$baseline_nopm") NOPM** at ${baseline_c} cores to"
-      echo "**$(printf "%'d" "${nopms[$last_i]}") NOPM** at ${done_cores[$last_i]} cores —"
+      echo "TPC-C OLTP workload across ${#cores_sorted[@]} CPU-core configurations"
+      echo "(${cores_sorted[*]} cores) on the system described below. Single-instance"
+      echo "throughput scaled from **$(printf "%'d" "$baseline_nopm") NOPM** at ${baseline_c} cores to"
+      echo "**$(printf "%'d" "${row_nopm[$top_single_i]}") NOPM** at ${row_cores[$top_single_i]} cores —"
       echo "a **${top_speedup}x** increase, demonstrating how additional AMD CPU cores"
       echo "translate directly into database transaction throughput."
     else
       echo "MariaDB ${MARIADB_VER} was benchmarked with HammerDB TPC-C across core"
-      echo "configurations: ${done_cores[*]}."
+      echo "configurations: ${cores_sorted[*]}."
+    fi
+    if [[ -n "$hero_single_nopm" && "$hero_single_nopm" =~ ^[0-9]+$ && $hero_i -ge 0 ]]; then
+      local uplift
+      uplift=$(awk -v a="${row_nopm[$hero_i]}" -v b="$hero_single_nopm" 'BEGIN{printf "%.2f", a/b}')
+      echo ""
+      echo "At ${row_cores[$hero_i]} cores, sharding into ${row_containers[$hero_i]} x ${SHARD_CORES}-core"
+      echo "independent MariaDB containers raised aggregate throughput to"
+      echo "**$(printf "%'d" "${row_nopm[$hero_i]}") NOPM**, versus **$(printf "%'d" "$hero_single_nopm") NOPM**"
+      echo "for a single ${row_cores[$hero_i]}-core instance — a **${uplift}x** improvement from"
+      echo "horizontal scale-out alone, recovering throughput that single-instance"
+      echo "lock/latch contention otherwise leaves on the table."
     fi
     echo ""
     echo "# System Under Test"
@@ -701,22 +1003,24 @@ build_report() {
     echo "|---|---|"
     echo "| Workload | HammerDB $(grep -oP '(?<=HAMMERDB_VERSION=\")[^\"]+' "$BASE_DIR/mariadb-tpcc-bench.sh" 2>/dev/null || echo 5.0) TPC-C (OLTP)$($RUN_TPCH && echo " + TPC-H SF=${TPCH_SF}") |"
     echo "| MariaDB | ${MARIADB_VER} (official Docker image, fresh instance per config) |"
-    echo "| Warehouses | ${WAREHOUSES} |"
+    local shard_default_ware=$(( SHARD_CORES * 10 )); (( shard_default_ware < 64 )) && shard_default_ware=64
+    echo "| Warehouses | ${WAREHOUSES} (single-instance); scale-out shards auto-sized to ${shard_default_ware} (10x${SHARD_CORES}c) unless --warehouses overridden |"
     echo "| Ramp-up / timed | ${RAMPUP} min / ${DURATION} min |"
     echo "| Virtual users | = core count (capped at 128) |"
-    echo "| Buffer pool | ${BUFFER_POOL} |"
+    echo "| Buffer pool | ${BUFFER_POOL} total (scale-out splits evenly across shards) |"
+    echo "| Scale-out | $($SCALE_OUT && echo "enabled — N x ${SHARD_CORES}-core independent containers per eligible core count" || echo disabled) |"
     echo "| CPU limiting | Docker cpu limit per run$( [[ -n "$NUMA_NODE" ]] && echo "; cpuset auto-derived from NUMA node ${NUMA_NODE}" ) |"
     echo "| InnoDB tuning | Per AMD EPYC RDBMS Tuning Guide (full my.cnf in Appendix A) |"
     echo ""
     echo "# TPC-C Results — Core Scaling"
     echo ""
     if [[ -n "$baseline_nopm" ]]; then
-      echo "| Cores | VUs | NOPM | Speedup vs ${baseline_c}c | Scaling efficiency | Avg pkg power (W) | NOPM/W |"
-      echo "|---:|---:|---:|---:|---:|---:|---:|"
-      local i
-      for i in "${!done_cores[@]}"; do
-        c="${done_cores[$i]}"
-        local n="${nopms[$i]}" v="${vus[$i]}" w="${watts[$i]}"
+      echo "| Cores | Mode | Containers | VUs | NOPM | Speedup vs ${baseline_c}c | Scaling efficiency | Avg pkg power (W) | NOPM/W |"
+      echo "|---:|---|---:|---:|---:|---:|---:|---:|---:|"
+      for i in "${!row_cores[@]}"; do
+        c="${row_cores[$i]}"
+        local n="${row_nopm[$i]}" v="${row_vus[$i]}" w="${row_watts[$i]}" containers="${row_containers[$i]}"
+        local mode_label="single"; [[ "${row_mode[$i]}" == scaleout ]] && mode_label="scale-out"
         local sp="-" eff="-" npw="-"
         if [[ "$n" =~ ^[0-9]+$ ]]; then
           sp=$(awk -v a="$n" -v b="$baseline_nopm" 'BEGIN{printf "%.2fx", a/b}')
@@ -725,11 +1029,14 @@ build_report() {
           [[ "$w" != "-" ]] && npw=$(awk -v a="$n" -v w="$w" 'BEGIN{printf "%.0f", a/w}')
           n=$(printf "%'d" "$n")
         fi
-        echo "| $c | $v | $n | $sp | $eff | $w | $npw |"
+        echo "| $c | $mode_label | $containers | $v | $n | $sp | $eff | $w | $npw |"
       done
       echo ""
       echo "Scaling efficiency = (NOPM speedup) / (core-count ratio); 100% is perfectly"
-      echo "linear. Power is the average CPU package draw (RAPL) over the whole config"
+      echo "linear. Scale-out rows are the sum of NOPM across N independent MariaDB"
+      echo "containers running concurrently — not a single-instance number — with"
+      echo "efficiency measured against total cores committed (N x shard size)."
+      echo "Power is the average CPU package draw (RAPL) over the whole config"
       echo "including schema build, so treat NOPM/W as indicative."
       if [[ -n "$NUMA_NODE" ]]; then
         if [[ -n "$RAPL_NODE_PKGS" ]]; then
@@ -746,12 +1053,14 @@ build_report() {
       echo ""
       echo '```'
       local max_n=1
-      for i in "${!done_cores[@]}"; do [[ "${nopms[$i]}" =~ ^[0-9]+$ ]] && (( nopms[i] > max_n )) && max_n=${nopms[$i]}; done
-      for i in "${!done_cores[@]}"; do
-        c="${done_cores[$i]}"; local n="${nopms[$i]}"
+      for i in "${!row_cores[@]}"; do [[ "${row_nopm[$i]}" =~ ^[0-9]+$ ]] && (( row_nopm[i] > max_n )) && max_n=${row_nopm[$i]}; done
+      for i in "${!row_cores[@]}"; do
+        c="${row_cores[$i]}"; local n="${row_nopm[$i]}"
         [[ "$n" =~ ^[0-9]+$ ]] || continue
+        local label="${c}c"
+        [[ "${row_mode[$i]}" == scaleout ]] && label="${c}c x${row_containers[$i]}(${SHARD_CORES}c)"
         local bars=$(( n * 50 / max_n )); (( bars < 1 )) && bars=1
-        printf "%4s cores | %s %s NOPM\n" "$c" "$(printf '#%.0s' $(seq 1 $bars))" "$(printf "%'d" "$n")"
+        printf "%14s | %s %s NOPM\n" "$label" "$(printf '#%.0s' $(seq 1 $bars))" "$(printf "%'d" "$n")"
       done
       echo '```'
     else
@@ -759,10 +1068,10 @@ build_report() {
     fi
     echo ""
 
-    # Latency + TPC-H sections lifted from the base runner's report
+    # Latency section lifted from the base runner's single-instance report
     local base_rpt="$rdir/benchmark_report.md"
     if [[ -f "$base_rpt" ]]; then
-      echo "# Transaction Latency & Detailed Results"
+      echo "# Transaction Latency & Detailed Results (single-instance runs)"
       echo ""
       awk '/^### Transaction Latency/,/^## Notes/' "$base_rpt" | sed '$d' \
         | sed 's/^####/##/; s/^###/#/' | sed 's/^# /## /'
@@ -778,15 +1087,19 @@ build_report() {
     echo "  comparable across database engines; TPM counts all five transaction types."
     echo "- Each core count runs in a fresh MariaDB container with a my.cnf scaled"
     echo "  to that core budget; the datadir volume is destroyed between configs."
+    echo "- Scale-out rows sum NOPM/TPM across N independently-sharded MariaDB"
+    echo "  containers benchmarked concurrently, each with its own schema, buffer"
+    echo "  pool slice, and CPU pin — a proxy for horizontal/sharded deployment,"
+    echo "  not a single logically-consistent database."
     echo "- Durability is relaxed for peak-throughput measurement"
     echo "  (\`innodb_flush_log_at_trx_commit=0\`, \`innodb_doublewrite=0\`);"
     echo "  production deployments should use safer settings."
     echo "- Results are for relative core-scaling comparison on this system and are"
     echo "  not audited TPC results; TPC-C/TPC-H are used per HammerDB fair-use."
     echo ""
-    echo "# Appendix A — MariaDB Configuration Per Core Count"
+    echo "# Appendix A — MariaDB Configuration Per Core Count (single-instance)"
     echo ""
-    for c in "${done_cores[@]}"; do
+    for c in "${cores_sorted[@]}"; do
       local cnf="$WORKDIR/bench/configs/${c}core.cnf"
       [[ -f "$cnf" ]] || continue
       echo "## ${c}-core my.cnf"
@@ -796,6 +1109,21 @@ build_report() {
       echo '```'
       echo ""
     done
+    if $SCALE_OUT && (( hero_i >= 0 )); then
+      local first_scaleout_c=""
+      for i in "${!row_cores[@]}"; do
+        if [[ "${row_mode[$i]}" == scaleout ]]; then first_scaleout_c="${row_cores[$i]}"; break; fi
+      done
+      local shard_cnf="$WORKDIR/bench-scaleout/${first_scaleout_c}core/shard0/configs/${SHARD_CORES}core.cnf"
+      if [[ -f "$shard_cnf" ]]; then
+        echo "# Appendix A2 — Scale-out Shard my.cnf (${SHARD_CORES}-core, used by every scale-out container)"
+        echo ""
+        echo '```ini'
+        cat "$shard_cnf"
+        echo '```'
+        echo ""
+      fi
+    fi
     echo "# Appendix B — Host Details"
     echo ""
     echo '```'
@@ -840,6 +1168,7 @@ main() {
   REPORT_BASENAME="amd-mariadb-poc-report"
 
   fetch_base_repo
+  check_scaleout_support
   wizard
   collect_sysinfo
   resolve_rapl_scope
@@ -863,9 +1192,10 @@ main() {
   section "PoC complete in $(( t_total / 60 )) min"
   log "Everything you need for the customer:"
   log "  Report      : $WORKDIR/${REPORT_BASENAME}.md$( [[ -f "$WORKDIR/${REPORT_BASENAME}.pdf" ]] && echo " (+ .pdf)" )"
-  log "  Raw results : $WORKDIR/bench/results/"
+  log "  Raw results : $WORKDIR/bench/results/  (single-instance)"
+  $SCALE_OUT && log "  Scale-out   : $WORKDIR/bench-scaleout/  (per-shard results)"
   log "  Configs     : $WORKDIR/bench/configs/"
-  log "  Metrics     : $WORKDIR/metrics/   (power, mpstat)"
+  log "  Metrics     : $WORKDIR/metrics/   (power, mpstat, scale-out aggregates)"
   log "  Sysinfo     : $WORKDIR/sysinfo/"
 }
 
