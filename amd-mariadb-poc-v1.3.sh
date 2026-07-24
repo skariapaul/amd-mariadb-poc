@@ -578,6 +578,12 @@ shard_cpusets() {
 
 # ── mpstat/RAPL sampling helpers (wrap a measured phase) ─────────────────────
 # start_sampling MDIR RAPL_MAX -> echoes "mpid rpid" (either may be blank)
+# NOTE: this function is called as `samp=$(start_sampling ...)` -- every
+# backgrounded job started here MUST redirect its own stdout/stderr away
+# from the default fd. Left unredirected, a background job inherits the
+# write end of the pipe this command substitution reads from; since
+# rapl_sample_loop runs forever, that pipe's write end would never close
+# and $(...) would block indefinitely waiting for EOF that never comes.
 start_sampling() {
   local mdir=$1 rapl_max=$2
   mkdir -p "$mdir"
@@ -587,7 +593,7 @@ start_sampling() {
   fi
   rm -f "$mdir/rapl_accum.txt"
   if [[ -n "${rapl_max:-}" ]] && ! $DRY_RUN; then
-    rapl_sample_loop "$mdir" "$rapl_max" 2 & rpid=$!
+    rapl_sample_loop "$mdir" "$rapl_max" 2 >/dev/null 2>&1 & rpid=$!
   fi
   echo "${mpid:-_} ${rpid:-_}"
 }
